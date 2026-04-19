@@ -10,9 +10,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.asr.data import AudioConfig, SpokenNumbersDataset, collate_batch
-from src.asr.metrics import cer
 from src.asr.model import ConvBiGRUCTC
-from src.asr.tokenizer import RussianNumberTokenizer, build_tokenizer
+from src.asr.tokenizer import NumberTokenizer, build_tokenizer
 from src.train_baseline import select_device
 
 
@@ -34,7 +33,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_model(
     checkpoint: dict[str, object],
-    tokenizer: RussianNumberTokenizer,
+    tokenizer: NumberTokenizer,
     device: torch.device,
 ) -> ConvBiGRUCTC:
     args = checkpoint["args"]
@@ -82,9 +81,6 @@ def main() -> int:
     predictions_path = output_dir / f"{args.split}_predictions.csv"
 
     rows: list[dict[str, object]] = []
-    total_cer = 0.0
-    total_examples = 0
-    speaker_scores: dict[str, list[float]] = {}
 
     for batch in tqdm(loader, desc=f"infer:{args.split}"):
         features = batch["features"].to(device)  # type: ignore[assignment]
@@ -94,37 +90,22 @@ def main() -> int:
         predicted_ids = log_probs.argmax(dim=-1).cpu().tolist()
         predicted_lengths = output_lengths.cpu().tolist()
         filenames = batch["filenames"]  # type: ignore[assignment]
-        speakers = batch["speakers"]  # type: ignore[assignment]
-        texts = batch.get("texts", [])
-        token_texts = batch.get("token_texts", [])
-
         for idx, filename in enumerate(filenames):
             frame_ids = predicted_ids[idx][: predicted_lengths[idx]]
             prediction = tokenizer.ctc_collapse(frame_ids)
             row: dict[str, object] = {
                 "filename": str(filename),
-                "speaker": str(speakers[idx]),
                 "prediction": prediction,
                 "prediction_len": len(prediction),
                 "prediction_words": tokenizer.ctc_collapse_words(frame_ids),
                 "prediction_words_raw": tokenizer.ctc_collapse_words_raw(frame_ids),
             }
-            if texts:
-                target = str(texts[idx])
-                score = cer(target, prediction)
-                row["target"] = target
-                row["target_len"] = len(target)
-                row["target_words"] = str(token_texts[idx])
-                row["cer"] = score
-                total_cer += score
-                total_examples += 1
-                speaker_scores.setdefault(str(speakers[idx]), []).append(score)
             rows.append(row)
 
     fieldnames = (
         list(rows[0].keys())
         if rows
-        else ["filename", "speaker", "prediction", "prediction_len"]
+        else ["filename", "prediction", "prediction_len"]
     )
     with predictions_path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
@@ -138,19 +119,6 @@ def main() -> int:
         "num_rows": len(rows),
         "predictions_path": str(predictions_path),
     }
-    if total_examples:
-        summary["mean_cer"] = total_cer / total_examples
-        summary["speaker_cer"] = {
-            speaker: sum(values) / len(values)
-            for speaker, values in sorted(speaker_scores.items())
-        }
-
-        worst_rows = sorted(rows, key=lambda row: float(row["cer"]), reverse=True)[:20]
-        worst_path = output_dir / f"{args.split}_worst_examples.json"
-        with worst_path.open("w", encoding="utf-8") as fp:
-            json.dump(worst_rows, fp, ensure_ascii=False, indent=2)
-        summary["worst_examples_path"] = str(worst_path)
-
     summary_path = output_dir / f"{args.split}_summary.json"
     with summary_path.open("w", encoding="utf-8") as fp:
         json.dump(summary, fp, ensure_ascii=False, indent=2)
