@@ -12,9 +12,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.asr.data import AudioConfig, SpokenNumbersDataset, collate_batch
-from src.asr.metrics import cer
+from src.asr.metrics import cer, compute_domain_cer_summary
 from src.asr.model import ConvBiGRUCTC
-from src.asr.tokenizer import RussianNumberTokenizer
+from src.asr.tokenizer import NumberTokenizer, build_tokenizer
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +37,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encoder-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--max-parameters",
+        type=int,
+        default=5_000_000,
+        help="Fail if model has more trainable params than this limit.",
+    )
+    parser.add_argument(
+        "--save-all-checkpoints",
+        action="store_true",
+        help="Save checkpoint after every epoch in output-dir/checkpoints.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="russian_number_words",
+        choices=["russian_number_words", "russian_number_compact"],
+    )
     return parser.parse_args()
 
 
@@ -62,7 +79,7 @@ def build_dataloader(
     *,
     data_root: Path,
     split: str,
-    tokenizer: RussianNumberTokenizer,
+    tokenizer: NumberTokenizer,
     audio_config: AudioConfig,
     batch_size: int,
     num_workers: int,
@@ -161,8 +178,9 @@ def evaluate(
     model: ConvBiGRUCTC,
     loader: DataLoader,
     criterion: nn.CTCLoss,
-    tokenizer: RussianNumberTokenizer,
+    tokenizer: NumberTokenizer,
     device: torch.device,
+    in_domain_speakers: set[str] | None = None,
 ) -> dict[str, object]:
     model.eval()
     total_loss = 0.0
@@ -221,12 +239,20 @@ def evaluate(
         speaker: sum(values) / len(values)
         for speaker, values in sorted(speaker_cers.items())
     }
-    return {
+    metrics: dict[str, object] = {
         "loss": total_loss / max(total_examples, 1),
         "cer": total_cer / max(total_examples, 1),
         "speaker_cer": mean_speaker_cer,
         "preview": preview,
     }
+    if in_domain_speakers:
+        domain_summary = compute_domain_cer_summary(speaker_cers, in_domain_speakers)
+        metrics["in_domain_cer"] = domain_summary.in_domain_cer
+        metrics["out_of_domain_cer"] = domain_summary.out_of_domain_cer
+        metrics["primary_hmean_cer"] = domain_summary.harmonic_mean_cer
+        metrics["in_domain_samples"] = domain_summary.in_domain_count
+        metrics["out_of_domain_samples"] = domain_summary.out_of_domain_count
+    return metrics
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -243,6 +269,16 @@ def format_model_info(model: nn.Module, device: torch.device) -> dict[str, objec
     }
 
 
+def cer_to_percent(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return float(value) * 100.0
+
+
+def speaker_cer_to_percent(speaker_cer: dict[str, float]) -> dict[str, float]:
+    return {speaker: float(cer_val) * 100.0 for speaker, cer_val in speaker_cer.items()}
+
+
 def main() -> int:
     args = parse_args()
     set_seed(args.seed)
@@ -251,7 +287,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device(args.device)
 
-    tokenizer = RussianNumberTokenizer()
+    tokenizer = build_tokenizer({"type": args.tokenizer, "blank_id": 0})
     audio_config = AudioConfig(n_mels=args.n_mels)
     train_loader = build_dataloader(
         data_root=args.data_root,
@@ -271,6 +307,10 @@ def main() -> int:
         num_workers=args.num_workers,
         shuffle=False,
     )
+    train_speakers = {
+        str(speaker)
+        for speaker in train_loader.dataset.df["spk_id"].dropna().astype(str).tolist()
+    }
 
     model = ConvBiGRUCTC(
         n_mels=args.n_mels,
@@ -288,25 +328,83 @@ def main() -> int:
 
     model_info = format_model_info(model, device)
     print(json.dumps(model_info, ensure_ascii=False, indent=2))
+    if not model_info["fits_5m_limit"] or int(model_info["num_parameters"]) > int(
+        args.max_parameters
+    ):
+        raise ValueError(
+            "Model exceeds parameter limit: "
+            f"{model_info['num_parameters']} > {args.max_parameters}"
+        )
 
-    best_cer = float("inf")
+    best_primary = float("inf")
+    best_ood = float("inf")
     history: list[dict[str, object]] = []
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-        dev_metrics = evaluate(model, dev_loader, criterion, tokenizer, device)
+        dev_metrics = evaluate(
+            model,
+            dev_loader,
+            criterion,
+            tokenizer,
+            device,
+            in_domain_speakers=train_speakers,
+        )
+        primary_hmean = dev_metrics.get("primary_hmean_cer")
+        in_domain_cer = dev_metrics.get("in_domain_cer")
+        out_domain_cer = dev_metrics.get("out_of_domain_cer")
+        speaker_cer_raw = dev_metrics["speaker_cer"]
+        assert isinstance(speaker_cer_raw, dict)
         epoch_metrics = {
             "epoch": epoch,
             "train_loss": train_loss,
             "dev_loss": dev_metrics["loss"],
-            "dev_cer": dev_metrics["cer"],
-            "speaker_cer": dev_metrics["speaker_cer"],
+            "dev_cer": cer_to_percent(float(dev_metrics["cer"])),
+            "dev_primary_hmean_cer": cer_to_percent(
+                float(primary_hmean) if primary_hmean is not None else None
+            ),
+            "dev_in_domain_cer": cer_to_percent(
+                float(in_domain_cer) if in_domain_cer is not None else None
+            ),
+            "dev_out_of_domain_cer": cer_to_percent(
+                float(out_domain_cer) if out_domain_cer is not None else None
+            ),
+            "speaker_cer": speaker_cer_to_percent(
+                {str(k): float(v) for k, v in speaker_cer_raw.items()}
+            ),
         }
         history.append(epoch_metrics)
         print(json.dumps(epoch_metrics, ensure_ascii=False))
 
-        if float(dev_metrics["cer"]) < best_cer:
-            best_cer = float(dev_metrics["cer"])
+        if args.save_all_checkpoints:
+            checkpoints_dir = output_dir / "checkpoints"
+            checkpoints_dir.mkdir(parents=True, exist_ok=True)
+            epoch_checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "tokenizer": tokenizer.config,
+                "audio_config": audio_config.__dict__,
+                "args": vars(args),
+                "metrics": dev_metrics,
+                "epoch": epoch,
+                "model_info": model_info,
+            }
+            torch.save(epoch_checkpoint, checkpoints_dir / f"epoch_{epoch:03d}.pt")
+
+        current_primary = dev_metrics.get("primary_hmean_cer")
+        if current_primary is None:
+            current_primary = float(dev_metrics["cer"])
+        current_primary = float(current_primary)
+        current_ood = float(dev_metrics.get("out_of_domain_cer") or float("inf"))
+
+        if (
+            current_primary < best_primary
+            or (
+                abs(current_primary - best_primary) <= 1e-12
+                and current_ood < best_ood
+            )
+        ):
+            best_primary = current_primary
+            best_ood = current_ood
             checkpoint = {
                 "model_state_dict": model.state_dict(),
                 "tokenizer": tokenizer.config,

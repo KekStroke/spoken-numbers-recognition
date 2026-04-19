@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.asr.features import compute_log_mel_spectrogram
-from src.asr.tokenizer import RussianNumberTokenizer
+from src.asr.tokenizer import NumberTokenizer
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,7 @@ class SpokenNumbersDataset(Dataset):
         self,
         data_root: Path,
         split: str,
-        tokenizer: RussianNumberTokenizer,
+        tokenizer: NumberTokenizer,
         audio_config: AudioConfig,
     ) -> None:
         self.data_root = Path(data_root)

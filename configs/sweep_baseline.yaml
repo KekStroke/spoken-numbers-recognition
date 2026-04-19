@@ -1,0 +1,45 @@
+data_root: data/processed_16k
+output_root: artifacts/sweeps
+run_name: ""
+
+train:
+  module: src.train_baseline
+  args:
+    data_root: data/processed_16k
+    epochs: 16
+    batch_size: 24
+    eval_batch_size: 48
+    weight_decay: 0.01
+    num_workers: 0
+    device: auto
+    n_mels: 80
+    dropout: 0.1
+    seed: 42
+    tokenizer: russian_number_words
+    max_parameters: 5000000
+    save_all_checkpoints: true
+
+sweep:
+  method: grid_search
+  fail_fast: true
+  metric:
+    key: dev_primary_hmean_cer
+    fallback_key: dev_cer
+    mode: min
+  params:
+    encoder_dim:
+      type: int
+      values: [128, 160, 192, 224, 256, 288]
+    encoder_layers:
+      type: int
+      values: [2]
+    learning_rate:
+      type: float
+      values: [0.001, 0.0005, 0.0003, 0.0002]
+  random_search:
+    n_trials: 20
+    seed: 42
+  optuna:
+    n_trials: 30
+    seed: 42
+    sampler: tpe

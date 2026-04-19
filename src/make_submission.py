@@ -12,12 +12,14 @@ from tqdm import tqdm
 
 from src.asr.data import AudioConfig, SpokenNumbersDataset, collate_batch
 from src.asr.model import ConvBiGRUCTC
-from src.asr.tokenizer import RussianNumberTokenizer, build_tokenizer
+from src.asr.tokenizer import NumberTokenizer, build_tokenizer
 from src.train_baseline import select_device
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build a Kaggle submission from a trained checkpoint.")
+    parser = argparse.ArgumentParser(
+        description="Build a Kaggle submission from a trained checkpoint."
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, default=Path("data/processed_16k"))
     parser.add_argument("--sample-submission", type=Path, required=True)
@@ -30,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 
 def build_model(
     checkpoint: dict[str, object],
-    tokenizer: RussianNumberTokenizer,
+    tokenizer: NumberTokenizer,
     device: torch.device,
 ) -> ConvBiGRUCTC:
     args = checkpoint["args"]
@@ -47,8 +49,13 @@ def build_model(
     return model
 
 
+def _posix_rel_path(path_like: str) -> str:
+    return Path(path_like).as_posix()
+
+
 def restore_original_filename(processed_filename: str, original_ext: str) -> str:
-    return str(Path(processed_filename).with_suffix(f".{original_ext}"))
+    ext = original_ext.removeprefix(".")
+    return Path(processed_filename).with_suffix(f".{ext}").as_posix()
 
 
 @torch.no_grad()
@@ -78,7 +85,7 @@ def main() -> int:
     model = build_model(checkpoint, tokenizer, device)
     test_df = pd.read_csv(args.data_root / "test.csv")
     ext_by_filename = {
-        str(row.filename): str(row.ext)
+        _posix_rel_path(str(row.filename)): str(row.ext)
         for row in test_df.itertuples(index=False)
     }
 
@@ -95,9 +102,10 @@ def main() -> int:
         for idx, processed_filename in enumerate(filenames):
             frame_ids = predicted_ids[idx][: predicted_lengths[idx]]
             transcription = tokenizer.ctc_collapse(frame_ids)
+            key = _posix_rel_path(str(processed_filename))
             original_filename = restore_original_filename(
-                str(processed_filename),
-                ext_by_filename[str(processed_filename)],
+                key,
+                ext_by_filename[key],
             )
             predictions.append(
                 {
@@ -112,14 +120,23 @@ def main() -> int:
     if len(sample_df) == len(submission_df):
         order_source = "sample_submission.csv"
         sample_order = sample_df["filename"].tolist()
-        submission_df = submission_df.set_index("filename").reindex(sample_order).reset_index()
+        submission_df = (
+            submission_df.set_index("filename").reindex(sample_order).reset_index()
+        )
         if submission_df["transcription"].isna().any():
-            missing = submission_df[submission_df["transcription"].isna()]["filename"].tolist()[:10]
+            missing = submission_df[submission_df["transcription"].isna()][
+                "filename"
+            ].tolist()[:10]
             raise ValueError(f"Missing predictions for filenames: {missing}")
 
     output_path = args.output.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    submission_df.to_csv(output_path, index=False, quoting=csv.QUOTE_MINIMAL)
+    submission_df.to_csv(
+        output_path,
+        index=False,
+        quoting=csv.QUOTE_MINIMAL,
+        lineterminator="\n",
+    )
 
     summary = {
         "checkpoint": str(args.checkpoint),
