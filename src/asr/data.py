@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
 
+import librosa
+import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
@@ -21,6 +24,49 @@ class AudioConfig:
     win_length: int = 400
     f_min: float = 20.0
     f_max: float | None = 7600.0
+    # Augmentation — only applied when the dataset split is "train".
+    aug_enabled: bool = False
+    # Audio speed perturbation (librosa.effects.time_stretch, pitch-preserving).
+    aug_speed_prob: float = 0.5
+    aug_speed_min: float = 0.9
+    aug_speed_max: float = 1.1
+    # SpecAugment: freq masks (rows along n_mels axis).
+    aug_freq_mask_num: int = 2
+    aug_freq_mask_width: int = 15
+    # SpecAugment: time masks (columns along time axis).
+    aug_time_mask_num: int = 2
+    aug_time_mask_width: int = 30
+    aug_time_mask_ratio: float = 0.2  # cap mask width at this fraction of T
+
+
+def spec_augment(
+    features: np.ndarray,
+    *,
+    freq_mask_num: int,
+    freq_mask_width: int,
+    time_mask_num: int,
+    time_mask_width: int,
+    time_mask_ratio: float,
+) -> np.ndarray:
+    if freq_mask_num <= 0 and time_mask_num <= 0:
+        return features
+    feats = features.copy()
+    n_mels, t = feats.shape
+    fill = float(feats.min())
+    for _ in range(max(0, freq_mask_num)):
+        w = random.randint(0, max(0, freq_mask_width))
+        if w <= 0 or n_mels - w <= 0:
+            continue
+        f0 = random.randint(0, n_mels - w)
+        feats[f0 : f0 + w, :] = fill
+    t_cap = max(1, min(time_mask_width, int(t * time_mask_ratio)))
+    for _ in range(max(0, time_mask_num)):
+        w = random.randint(0, t_cap)
+        if w <= 0 or t - w <= 0:
+            continue
+        t0 = random.randint(0, t - w)
+        feats[:, t0 : t0 + w] = fill
+    return feats
 
 
 class SpokenNumbersDataset(Dataset):
@@ -52,6 +98,20 @@ class SpokenNumbersDataset(Dataset):
                 f"Expected {self.audio_config.sample_rate} Hz, got {sample_rate} for {audio_path}"
             )
 
+        augment_active = (
+            self.split == "train" and self.audio_config.aug_enabled
+        )
+
+        # Speed perturbation (audio-level). time_stretch preserves pitch and
+        # operates on the waveform; the mel is recomputed after stretching.
+        if augment_active and random.random() < self.audio_config.aug_speed_prob:
+            speed = random.uniform(
+                self.audio_config.aug_speed_min,
+                self.audio_config.aug_speed_max,
+            )
+            if abs(speed - 1.0) > 1e-3:
+                audio = librosa.effects.time_stretch(y=audio, rate=speed)
+
         features = compute_log_mel_spectrogram(
             audio,
             sample_rate=sample_rate,
@@ -62,6 +122,16 @@ class SpokenNumbersDataset(Dataset):
             f_min=self.audio_config.f_min,
             f_max=self.audio_config.f_max,
         )
+
+        if augment_active:
+            features = spec_augment(
+                features,
+                freq_mask_num=self.audio_config.aug_freq_mask_num,
+                freq_mask_width=self.audio_config.aug_freq_mask_width,
+                time_mask_num=self.audio_config.aug_time_mask_num,
+                time_mask_width=self.audio_config.aug_time_mask_width,
+                time_mask_ratio=self.audio_config.aug_time_mask_ratio,
+            )
 
         item: dict[str, object] = {
             "features": torch.from_numpy(features),

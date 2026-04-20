@@ -7,11 +7,11 @@ train:
   args:
     data_root: data/processed_16k
     epochs: 16
-    batch_size: 24
-    eval_batch_size: 48
+    batch_size: 128
+    eval_batch_size: 256
     weight_decay: 0.01
-    num_workers: 0
-    device: auto
+    num_workers: 16
+    device: cuda
     n_mels: 80
     dropout: 0.1
     seed: 42

@@ -12,5 +12,9 @@ data/
 artifacts/
 TASK.md
 
+# MLCore job presets live alongside the repo but contain
+# internal (NDA) infra details — keep them out of git.
+mlcore/
+
 *.pt
 *.ckpt
