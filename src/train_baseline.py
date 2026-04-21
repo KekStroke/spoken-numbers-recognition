@@ -8,6 +8,11 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -53,6 +58,41 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="russian_number_words",
         choices=["russian_number_words", "russian_number_compact"],
+    )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Enable SpecAugment (freq/time masks) and audio speed perturbation on the train split.",
+    )
+    parser.add_argument(
+        "--aug-speed-prob", type=float, default=0.5,
+        help="Probability of applying speed perturbation to a train sample.",
+    )
+    parser.add_argument("--aug-speed-min", type=float, default=0.9)
+    parser.add_argument("--aug-speed-max", type=float, default=1.1)
+    parser.add_argument("--aug-freq-mask-num", type=int, default=2)
+    parser.add_argument("--aug-freq-mask-width", type=int, default=15)
+    parser.add_argument("--aug-time-mask-num", type=int, default=2)
+    parser.add_argument("--aug-time-mask-width", type=int, default=30)
+    parser.add_argument("--aug-time-mask-ratio", type=float, default=0.2)
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="none",
+        choices=["none", "cosine"],
+        help="LR schedule: 'cosine' = linear warmup + cosine annealing (per-step).",
+    )
+    parser.add_argument(
+        "--warmup-epochs",
+        type=float,
+        default=3.0,
+        help="Number of warmup epochs (fractional allowed) for cosine scheduler.",
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.01,
+        help="Minimum LR at end of cosine, as fraction of peak LR.",
     )
     return parser.parse_args()
 
@@ -143,6 +183,7 @@ def train_one_epoch(
     optimizer: AdamW,
     criterion: nn.CTCLoss,
     device: torch.device,
+    scheduler: object | None = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -165,12 +206,50 @@ def train_one_epoch(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         batch_size = features.size(0)
         total_loss += float(loss.item()) * batch_size
         total_examples += batch_size
 
     return total_loss / max(total_examples, 1)
+
+
+def build_scheduler(
+    *,
+    optimizer: AdamW,
+    scheduler_kind: str,
+    steps_per_epoch: int,
+    epochs: int,
+    warmup_epochs: float,
+    min_lr_ratio: float,
+) -> object | None:
+    if scheduler_kind == "none":
+        return None
+    if scheduler_kind != "cosine":
+        raise ValueError(f"Unsupported scheduler: {scheduler_kind!r}")
+    total_steps = max(1, steps_per_epoch * epochs)
+    warmup_steps = max(1, int(round(warmup_epochs * steps_per_epoch)))
+    warmup_steps = min(warmup_steps, total_steps - 1)
+    cosine_steps = max(1, total_steps - warmup_steps)
+    start_factor = max(min_lr_ratio, 1e-3)
+    warmup = LinearLR(
+        optimizer,
+        start_factor=start_factor,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=optimizer.param_groups[0]["lr"] * min_lr_ratio,
+    )
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
+    )
 
 
 @torch.no_grad()
@@ -288,7 +367,18 @@ def main() -> int:
     device = select_device(args.device)
 
     tokenizer = build_tokenizer({"type": args.tokenizer, "blank_id": 0})
-    audio_config = AudioConfig(n_mels=args.n_mels)
+    audio_config = AudioConfig(
+        n_mels=args.n_mels,
+        aug_enabled=bool(args.augment),
+        aug_speed_prob=float(args.aug_speed_prob),
+        aug_speed_min=float(args.aug_speed_min),
+        aug_speed_max=float(args.aug_speed_max),
+        aug_freq_mask_num=int(args.aug_freq_mask_num),
+        aug_freq_mask_width=int(args.aug_freq_mask_width),
+        aug_time_mask_num=int(args.aug_time_mask_num),
+        aug_time_mask_width=int(args.aug_time_mask_width),
+        aug_time_mask_ratio=float(args.aug_time_mask_ratio),
+    )
     train_loader = build_dataloader(
         data_root=args.data_root,
         split="train",
@@ -325,6 +415,14 @@ def main() -> int:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    scheduler = build_scheduler(
+        optimizer=optimizer,
+        scheduler_kind=args.scheduler,
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        min_lr_ratio=args.min_lr_ratio,
+    )
 
     model_info = format_model_info(model, device)
     print(json.dumps(model_info, ensure_ascii=False, indent=2))
@@ -341,7 +439,10 @@ def main() -> int:
     history: list[dict[str, object]] = []
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, scheduler=scheduler
+        )
+        current_lr = float(optimizer.param_groups[0]["lr"])
         dev_metrics = evaluate(
             model,
             dev_loader,
@@ -357,6 +458,7 @@ def main() -> int:
         assert isinstance(speaker_cer_raw, dict)
         epoch_metrics = {
             "epoch": epoch,
+            "lr": current_lr,
             "train_loss": train_loss,
             "dev_loss": dev_metrics["loss"],
             "dev_cer": cer_to_percent(float(dev_metrics["cer"])),
