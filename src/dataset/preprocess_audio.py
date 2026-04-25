@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         help="Write mirrored tree of .wav files here (and copy/update CSVs).",
     )
     p.add_argument(
+        "--splits",
+        type=str,
+        default="train,dev,test",
+        help="Comma-separated splits to process (default: train,dev,test).",
+    )
+    p.add_argument(
         "--sample-rate",
         type=int,
         default=16000,
@@ -116,9 +122,19 @@ def main() -> int:
     args = parse_args()
     data_root = args.data_root.resolve()
     out_root = args.output_dir.resolve()
+    splits = [s.strip().lower() for s in args.splits.split(",") if s.strip()]
+    valid_splits = {"train", "dev", "test"}
+    invalid = [s for s in splits if s not in valid_splits]
+    if invalid:
+        print(f"Invalid --splits values: {invalid}", file=sys.stderr)
+        return 1
+    if not splits:
+        print("No splits provided via --splits", file=sys.stderr)
+        return 1
     clip_splits = {s.strip().lower() for s in args.clip_splits.split(",") if s.strip()}
 
-    for name in ("train.csv", "dev.csv", "test.csv"):
+    for split in splits:
+        name = f"{split}.csv"
         p = data_root / name
         if not p.is_file():
             print(f"Missing {p}", file=sys.stderr)
@@ -127,7 +143,7 @@ def main() -> int:
     n_ok = n_skip = n_err = 0
     errors: list[str] = []
 
-    for split in ("train", "dev", "test"):
+    for split in splits:
         csv_path = data_root / f"{split}.csv"
         df = pd.read_csv(csv_path)
         if "filename" not in df.columns:
@@ -164,7 +180,8 @@ def main() -> int:
 
     if args.copy_csv:
         out_root.mkdir(parents=True, exist_ok=True)
-        for name in ("train.csv", "dev.csv", "test.csv"):
+        for split in splits:
+            name = f"{split}.csv"
             src_c = data_root / name
             dst_c = out_root / name
             shutil.copy2(src_c, dst_c)

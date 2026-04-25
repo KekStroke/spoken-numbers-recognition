@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- paths ----
-REPO_DIR="/app/spoken-numbers-recognition"
+REPO_DIR="${REPO_DIR:-/app/spoken-numbers-recognition}"
 DATA_DIR="${REPO_DIR}/data/processed_16k"
 ART_DIR="${REPO_DIR}/artifacts"
 RUN_DIR="${ART_DIR}/single_best"
